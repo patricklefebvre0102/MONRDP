@@ -1,0 +1,70 @@
+name: Gardien RDP
+
+# Le gardien verifie regulierement qu'une session RDP tourne. S'il n'y en a aucune
+# (coupure imprevue, fin de chaine...), il en relance une et t'envoie une alerte.
+#
+# INTERRUPTEUR : il ne fait rien tant que la variable GARDIEN_ACTIF n'est pas "true"
+#   Settings > Secrets and variables > Actions > onglet Variables > New repository variable
+#   Pour l'arreter pour de bon : mets GARDIEN_ACTIF a "false" (ou supprime-la), PUIS annule la session.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # toutes les 30 minutes (GitHub peut retarder un peu)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: gardien
+  cancel-in-progress: false
+
+jobs:
+  garde:
+    # Si l'interrupteur est coupe, le job est ignore (et ne consomme aucune minute).
+    if: vars.GARDIEN_ACTIF == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      MAX_PAR_JOUR: ${{ vars.GARDIEN_MAX_PAR_JOUR || '4' }}
+    steps:
+      - name: Verifier et relancer si besoin
+        shell: bash
+        run: |
+          set -u
+
+          notify() {
+            [ -n "${NTFY_TOPIC:-}" ] || return 0
+            curl -fsS -m 15 -H "Title: $1" -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null || true
+          }
+
+          # 1. Y a-t-il deja une session active ou en attente ?
+          actifs=0
+          for s in in_progress queued waiting pending requested; do
+            n=$(gh run list --workflow rdp.yml --status "$s" --json databaseId --jq 'length' 2>/dev/null || echo 0)
+            actifs=$((actifs + n))
+          done
+          echo "Sessions actives ou en attente : $actifs"
+          if [ "$actifs" -gt 0 ]; then
+            echo "Tout va bien, rien a faire."
+            exit 0
+          fi
+
+          # 2. Garde-fou : plafond de sessions sur 24 h (protege ton quota GitHub)
+          depuis=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          recents=$(gh run list --workflow rdp.yml --created ">=$depuis" --limit 100 --json databaseId --jq 'length')
+          echo "Sessions lancees ces 24 h : $recents (plafond : $MAX_PAR_JOUR)"
+          if [ "$recents" -ge "$MAX_PAR_JOUR" ]; then
+            echo "Plafond atteint : pas de relance."
+            notify "Gardien RDP" "Aucune session active, mais le plafond de $MAX_PAR_JOUR sessions par 24 h est atteint. Pas de relance (quota protege)."
+            exit 0
+          fi
+
+          # 3. Relance (valeurs par defaut du workflow rdp.yml)
+          echo "Aucune session active : relance."
+          gh workflow run rdp.yml --ref "$GITHUB_REF_NAME"
+          notify "Gardien RDP" "Aucune session active : une nouvelle session vient d'etre lancee. Reconnecte-toi dans 3 a 6 minutes."
